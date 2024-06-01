@@ -334,8 +334,8 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
 
         if discrepancy == Decimal('0.00'):
             print(f"All transactions for account {account} have been reconciled.")
-            cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE account = ? AND reconciled = 0 AND transaction_date <= ?', 
-                           (current_balance_date, account, current_balance_date))
+            cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE account = ? AND reconciled = 0', 
+                           (current_balance_date, account))
             cursor.execute('UPDATE account_balances SET last_reconciled_balance = ?, last_reconciled_date = ? WHERE account = ?', 
                            (current_balance, current_balance_date, account))
             conn.commit()
@@ -385,17 +385,46 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
 
         if potential_matches:
             print(f"Potential transactions matching the discrepancy for account {account}:")
-            for trans in potential_matches:
-                print(f"- Date: {trans[1]}, Amount: {trans[2]}")
 
-            confirm = input("Do you want to mark these transactions as reconciled? (yes/no): ")
-            if confirm.lower() in ['yes', 'y']:
-                for trans in potential_matches:
-                    cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE id = ?', (current_balance_date, trans[0]))
-                cursor.execute('UPDATE account_balances SET last_reconciled_balance = ?, last_reconciled_date = ? WHERE account = ?', 
-                               (current_balance, current_balance_date, account))
-                conn.commit()
-                print(f"Transactions reconciled for account {account}.")
+            for i, combo in enumerate(potential_matches):
+                print(f"Combination {i + 1}:")
+                print(f"{'ID':<5} {'Date':<15} {'Merchant':<25} {'Amount':<10}")
+                print("-" * 60)
+                for trans in combo:
+                    transaction_details = get_transaction_details_by_id(cursor, trans[0])
+                    if transaction_details:
+                        print(f"{trans[0]:<5} {transaction_details[0]:<15} {transaction_details[1]:<25} {transaction_details[2]:<10}")
+                    else:
+                        print(f"{trans[0]:<5} {trans[1]:<15} {"NOT FOUND":<25} {trans[2]:<10}")
+                        print(f"  - Date: {trans[1]}, Amount: {trans[2]}")
+                print("\n")
+
+            selected_combo_index = int(input("Select the combination number to skip for a successful reconciliation (or -1 to not reconcile this account): "))
+            if selected_combo_index > 0 and selected_combo_index <= len(potential_matches):
+                selected_combo = potential_matches[selected_combo_index - 1]
+                selected_ids = [trans[0] for trans in selected_combo]
+
+                # Verify the sum of amounts matches the expected change in balance
+                cursor.execute('SELECT SUM(amount) FROM transactions WHERE account = ? AND reconciled = 0 AND id NOT IN ({seq})'.format(seq=','.join(['?']*len(selected_ids))),
+                               (account, *selected_ids))
+                verified_sum = cursor.fetchone()[0]
+                if verified_sum is None:
+                    verified_sum = Decimal('0.0')
+                else:
+                    verified_sum = Decimal(verified_sum).quantize(cent)
+
+                expected_change = online_balance_change.quantize(cent)
+
+                if verified_sum == expected_change:
+                    # Proceed with reconciliation
+                    cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE account = ? AND reconciled = 0 AND id NOT IN ({seq})'.format(seq=','.join(['?']*len(selected_ids))), 
+                                   (current_balance_date, account, *selected_ids))
+                    cursor.execute('UPDATE account_balances SET last_reconciled_balance = ?, last_reconciled_date = ? WHERE account = ?', 
+                                   (current_balance, current_balance_date, account))
+                    conn.commit()
+                    print(f"All transactions except the selected ones have been reconciled for account {account}.")
+                else:
+                    print(f"Sum of amounts to be reconciled ({verified_sum}) does not match the expected change in balance ({expected_change}). No transactions were reconciled.")
             else:
                 print(f"Transactions not reconciled for account {account}.")
         else:
@@ -416,7 +445,21 @@ def estimate_processing_time(num_transactions, limit_combos=None):
     return est_time, combinations_count
 
 def process_combinations(transactions, discrepancy, r):
-    return [combo for combo in combinations(transactions, r) if sum(trans[2] for trans in combo) == -discrepancy]
+    # Create a list to hold the valid combinations
+    valid_combinations = []
+    
+    # Generate all combinations of size 'r' from the 'transactions' list
+    for combo in combinations(transactions, r):
+        # Calculate the sum of the amounts in the combination
+        combo_sum = Decimal(sum(Decimal(trans[2]) for trans in combo)).quantize(cent)
+        
+        # Check if the sum matches the negative of the discrepancy
+        if combo_sum == -discrepancy:
+            # If it matches, add the combination to the valid_combinations list
+            valid_combinations.append(combo)
+    
+    # Return the list of valid combinations
+    return valid_combinations
 
 def find_matching_transactions_parallel(transactions, discrepancy, limit_combos=None):
     num_transactions = len(transactions)
@@ -452,6 +495,7 @@ def find_most_recent_matching_file(directory, pattern):
         latest_file = max(files, key=os.path.getmtime)
         return latest_file
 
+
 def verify_or_request_file(import_folder, pattern, file_description):
     """
     Attempts to find the most recent file matching a pattern. If not found, prompts the user for the file path.
@@ -480,6 +524,11 @@ def verify_or_request_file(import_folder, pattern, file_description):
                 return normalized_path
             else:
                 print("File not found, please try again.")
+
+# Initially used for looking up merchant details from the trans tuples in potential_matches
+def get_transaction_details_by_id(cursor, transaction_id):
+    cursor.execute('SELECT transaction_date, merchant, amount FROM transactions WHERE id = ?', (transaction_id,))
+    return cursor.fetchone()
 
 
 if __name__ == "__main__":
