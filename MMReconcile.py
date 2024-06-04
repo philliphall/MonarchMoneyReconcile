@@ -22,14 +22,18 @@ from datetime import datetime, timedelta
 from itertools import combinations
 import multiprocessing # Used to more quickly identify combinations of potentially problematic transactions
 from decimal import Decimal, getcontext
-from math import comb  # Import the comb function for binomial coefficient calculation
-import time
+from math import comb, ceil  # Import the comb function for binomial coefficient calculation
+import random
+from timeit import default_timer as timer
+import shutil
 
 
 ### Configuration ###
 db_path = "C:\\Users\\Music\\OneDrive\\Documents\\reconciliation.db" # Where you would like our reconiliation database persistenly stored
+max_backups = 20
 import_folder = "C:\\Users\\Music\\Downloads\\testing\\" # Where to find export tiles from Monarch Money
 earliest_reconcile_date = "2023-01-01"  # Specify the earliest date to reconcile
+combine_sofi_vaults = True # Okay, this is a weird special case. SoFi bank offers "Vaults" as part of their Savings Account, and some aggregators treat these weird. This will combine the transactions and balances of any accounts that match "SoFi Vault" into the account matching "SoFi Savings" - of which there must be only one or I don't know what will happen.
 
 
 ### Initialization ###
@@ -53,10 +57,14 @@ time_per_combination = None
 
 
 
+
 ##########
 ## MAIN ##
 ##########
 def main():
+    # Backup the database before making any changes
+    backup_database(db_path, max_backups)
+
     # Initialize the database tables
     initialize_db(db_path)
 
@@ -112,6 +120,38 @@ def initialize_db(db_path='reconciliation.db'):
     conn.commit()
     conn.close()
 
+def backup_database(db_path, max_backups=20):
+    if not os.path.exists(db_path):
+        print("No database found to backup.")
+        return
+
+    # Determine the backup folder path
+    backup_folder = os.path.join(os.path.dirname(db_path), "reconciliation_backups")
+
+    # Create the backup folder if it doesn't exist
+    if not os.path.exists(backup_folder):
+        os.makedirs(backup_folder)
+
+    # Create a dated backup of the database
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_path = os.path.join(backup_folder, f"reconciliation_backup_{timestamp}.db")
+    shutil.copy2(db_path, backup_path)
+    print(f" - Database backed up to {backup_path}")
+
+    # Get a list of existing backups
+    backups = sorted(
+        [f for f in os.listdir(backup_folder) if f.startswith("reconciliation_backup_")],
+        key=lambda x: os.path.getmtime(os.path.join(backup_folder, x))
+    )
+
+    # If there are more backups than allowed, delete the oldest ones
+    extra_backups = len(backups) - max_backups
+    if extra_backups > 0:
+        for old_backup in backups[:extra_backups]:
+            old_backup_path = os.path.join(backup_folder, old_backup)
+            os.remove(old_backup_path)
+            print(f" - Deleted old backup {old_backup_path}")
+
 
 
 ### Step 2: Importing Transactionns
@@ -152,6 +192,10 @@ def import_transactions(csv_path, db_path='reconciliation.db', earliest_reconcil
     # Filter out transactions before the earliest reconcile date
     if earliest_reconcile_date:
         transactions = transactions[transactions['transaction_date'] >= earliest_reconcile_date]
+
+    # Combine SoFi Vault transactions with SoFi Savings
+    if combine_sofi_vaults:
+        transactions = combine_SoFi_vault_transactions(transactions)   
 
     # Connect to the SQLite database
     conn = sqlite3.connect(db_path)
@@ -222,7 +266,7 @@ def import_transactions(csv_path, db_path='reconciliation.db', earliest_reconcil
 
     # Display unmatched transactions and prompt user for action
     if num_unmatched_in_db > 0:
-        print("\nUnmatched transactions in the database:")
+        print("\nUnmatched transactions in the database (usually they were pending before):")
         print(f"{'ID':<5} {'Account':<15} {'Date':<15} {'Merchant':<25} {'Amount':<10} {'Reconciled':<10}")
         print("-" * 80)
         for idx, row in unmatched_in_db.sort_values(by=['account', 'transaction_date']).iterrows():
@@ -249,6 +293,22 @@ def import_transactions(csv_path, db_path='reconciliation.db', earliest_reconcil
     # Close the connection
     conn.close()
 
+def combine_SoFi_vault_transactions(transactions):
+    # Identify all rows where the account contains "SoFi Vault"
+    sofi_vault_transactions = transactions[transactions['account'].str.contains("SoFi Vault", case=False)]
+    
+    if not sofi_vault_transactions.empty:
+        # Retrieve the exact name of the "SoFi Savings" account from the transactions DataFrame
+        sofi_savings_account = transactions[transactions['account'].str.contains("SoFi Savings", case=False)]['account'].iloc[0]
+        
+        # Update the 'account' field to the exact "SoFi Savings" account name for these transactions
+        transactions.loc[transactions['account'].str.contains("SoFi Vault", case=False), 'account'] = sofi_savings_account
+        print(" - Associated SoFi Vault transactions with SoFi Savings account successfully.")
+    else:
+        print(" - No SoFi Vault transactions found to associate.")
+    
+    return transactions
+
 
 
 ### Step 3: Import current balances
@@ -260,6 +320,10 @@ def load_daily_balances(csv_path):
         
         # Normalize date format if necessary
         daily_balances['date'] = pd.to_datetime(daily_balances['date']).dt.strftime('%Y-%m-%d')
+
+        # Attempt combining SoFi Vaults if specified
+        if combine_sofi_vaults:
+            combine_SoFi_vault_balances(daily_balances)
         
         print(" - Daily balances have been loaded successfully.")
         return daily_balances
@@ -267,8 +331,40 @@ def load_daily_balances(csv_path):
         print(f"An error occurred while loading daily balances: {e}")
         sys.exit(1)
         
+def combine_SoFi_vault_balances(daily_balances):
+    # Identify all rows where the account contains "SoFi Vault"
+    sofi_vaults = daily_balances[daily_balances['account'].str.contains("SoFi Vault", case=False)]
+    
+    # Sum the balances of these accounts by date
+    vault_sums = sofi_vaults.groupby('date')['balance'].sum().reset_index()
+    
+    # Identify the SoFi Savings account
+    sofi_savings = daily_balances[daily_balances['account'].str.contains("SoFi Savings", case=False)]
+    
+    if not sofi_savings.empty:
+        # Merge the sums of the SoFi Vault accounts with the SoFi Savings balances by date
+        merged = pd.merge(sofi_savings, vault_sums, on='date', how='left', suffixes=('_savings', '_vaults'))
         
+        # Replace NaN values in vault balances with 0
+        merged['balance_vaults'] = merged['balance_vaults'].fillna(0)
         
+        # Add the balances of the SoFi Vault accounts to the SoFi Savings account balances
+        merged['balance'] = merged['balance_savings'] + merged['balance_vaults']
+        
+        # Update the original daily_balances DataFrame with the new combined balances
+        for idx, row in merged.iterrows():
+            daily_balances.loc[
+                (daily_balances['date'] == row['date']) & 
+                (daily_balances['account'] == row['account']), 
+                'balance'
+            ] = row['balance']
+        
+        print(" - Combined SoFi Vault balances into SoFi Savings account successfully.")
+    else:
+        print(" - SoFi Savings account not found in the daily balances.")
+    
+    return daily_balances
+
 ### Step 4: User Interaction for Initial Reconciliation
 def set_initial_balances(db_path='reconciliation.db', balance_df=None, earliest_reconcile_date=None):
     conn = sqlite3.connect(db_path)
@@ -345,13 +441,15 @@ def set_initial_balances(db_path='reconciliation.db', balance_df=None, earliest_
 
 ### Step 5: Reconcile balances
 def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
+    reconciliation_summary = {} # Initialize
+    
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     # Fetch all accounts
     cursor.execute('SELECT DISTINCT account FROM transactions')
     accounts = [row[0] for row in cursor.fetchall()]
-
+    
     for account in accounts:
         # Fetch the last reconciled balance and date for the account
         cursor.execute('SELECT last_reconciled_balance, last_reconciled_date FROM account_balances WHERE account = ?', (account,))
@@ -381,167 +479,294 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
         # Calculate the discrepancy only to the cent. This compensates for arbitrary extra decimal places
         discrepancy = (online_balance_change - transaction_balance_change).quantize(cent)
 
+        reconciliation_summary[account] = {
+            "initial_balance": Decimal(last_reconciled_balance).quantize(cent),
+            "online_balance": Decimal(current_balance).quantize(cent),
+            "transaction_discrepancy": discrepancy
+        }
+
         if discrepancy == Decimal('0.00'):
-            print(f"\n\nAll transactions for account {account} add up and have been reconciled.")
             cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE account = ? AND reconciled = 0', 
                            (current_balance_date, account))
             cursor.execute('UPDATE account_balances SET last_reconciled_balance = ?, last_reconciled_date = ? WHERE account = ?', 
                            (current_balance, current_balance_date, account))
             conn.commit()
+            print(f"\n\nAll transactions for account {account} add up and have been reconciled.")
+            reconciliation_summary[account]["result"] = "Fully reconciled with no discrepancies."
             continue
 
+        # There's discrepancy. Start researching it.
         print(f"\n\nDiscrepancy of {discrepancy} found for account {account}.")
+        resolved = False
+
+        ## SIMPLE SEARCHING ##
+        # Get all non-reconciled transactions
+        all_unreconciled_transactions = cursor.execute('''SELECT id, transaction_date, amount FROM transactions WHERE account = ? AND reconciled = 0''', (account,)).fetchall()
+
+        # Check for transactions in the last 5 days that resolve the discrepancy
+        last_5_days_transactions = cursor.execute('''
+            SELECT id, transaction_date, amount FROM transactions 
+            WHERE account = ? AND transaction_date >= ?
+        ''', (account, (datetime.strptime(current_balance_date, '%Y-%m-%d') - timedelta(days=5)).strftime('%Y-%m-%d'))).fetchall()
+
+        # Send these transactions for processing
+        potential_matches = find_matching_transactions(last_5_days_transactions, discrepancy)
+        if potential_matches:
+            if len(potential_matches) == 1:
+                print("Identified transactions in the last 5 days that resolve the discrepancy, usually pending transactions:")
+                resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance, display_only=True)
+                if resolved:
+                    conn.commit()
+                    reconciliation_summary[account]["result"] = "Reconciled with transactions pending."
+                    continue
+            else:
+                # Send these transactions for more normal processing
+                potential_matches = find_matching_transactions(recent_and_surrounding_transactions, discrepancy)
+                if potential_matches:
+                    resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
+                    if resolved:
+                        conn.commit()
+                        reconciliation_summary[account]["result"] = "Reconciled with exclusions/deletions after simple searching."
+                        continue
+        
+        # Fast check for single transaction exact matches
+        exact_matches = [trans for trans in all_unreconciled_transactions if Decimal(trans[2]).quantize(cent) == -discrepancy]
+        if exact_matches:
+            print("Exact matches found that directly resolve the discrepancy:")
+            
+            # Process these exact matches
+            resolved = process_potential_matches(cursor, account, [exact_matches], current_balance_date, current_balance)
+            if resolved:
+                conn.commit()
+                reconciliation_summary[account]["result"] = "Reconciled directly with exact matches."
+                continue
 
         # Check for discrepancies in the last 5 days and around the last reconciled date
-        recent_and_surrounding_transactions = cursor.execute('''
-            SELECT id, transaction_date, amount FROM transactions 
-            WHERE account = ? AND (transaction_date >= ? OR 
-                                   transaction_date BETWEEN ? AND ?) AND reconciled = 0
-        ''', (account, 
-              (datetime.strptime(current_balance_date, '%Y-%m-%d') - timedelta(days=5)).strftime('%Y-%m-%d'),
-              (datetime.strptime(last_reconciled_date, '%Y-%m-%d') - timedelta(days=3)).strftime('%Y-%m-%d'),
-              (datetime.strptime(last_reconciled_date, '%Y-%m-%d') + timedelta(days=3)).strftime('%Y-%m-%d'))).fetchall()
-
-        potential_matches = find_matching_transactions_parallel(recent_and_surrounding_transactions, discrepancy)
-
-        # If we didn't get recent or surrounding matches
-        if not potential_matches:
-            # Check for discrepancies across all unreconciled transactions
-            all_unreconciled_transactions = cursor.execute('''
+        if not resolved:
+            recent_and_surrounding_transactions = cursor.execute('''
                 SELECT id, transaction_date, amount FROM transactions 
-                WHERE account = ? AND reconciled = 0
-            ''', (account,)).fetchall()
+                WHERE account = ? AND (transaction_date >= ? OR 
+                                    transaction_date BETWEEN ? AND ?) AND reconciled = 0
+            ''', (account, 
+                (datetime.strptime(current_balance_date, '%Y-%m-%d') - timedelta(days=5)).strftime('%Y-%m-%d'),
+                (datetime.strptime(last_reconciled_date, '%Y-%m-%d') - timedelta(days=3)).strftime('%Y-%m-%d'),
+                (datetime.strptime(last_reconciled_date, '%Y-%m-%d') + timedelta(days=3)).strftime('%Y-%m-%d'))).fetchall()
+
+            # Send these transactions for processing
+            potential_matches = find_matching_transactions(recent_and_surrounding_transactions, discrepancy)
+            if potential_matches:
+                resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
+                if resolved:
+                    conn.commit()
+                    reconciliation_summary[account]["result"] = "Reconciled with exclusions/deletions after simple searching."
+                    continue
+
+        ## EXTENSIVE SEARCHING ##
+        if not resolved:
             
+            # Maybe check for discrepancies across all unreconciled transactions
             num_transactions = len(all_unreconciled_transactions)
             est_all = estimate_processing_time(num_transactions)
 
             # Determine if it's reasonable to just look through all missing transactions
             if est_all[0] < 30 and (est_all[0] > 0 or num_transactions < 10):
-                user_input = 'a'
-            
+                potential_matches = find_matching_transactions(all_unreconciled_transactions, discrepancy)
+                if potential_matches:
+                    resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
+                    if resolved:
+                        conn.commit()
+                        reconciliation_summary[account]["result"] = "Reconciled with exclusions/deletions after searching all transactions."
+                        continue                        
+
             # Otherwise ask user what they want to do
             else:
-                est_1 = estimate_processing_time(num_transactions, limit_combos=1)
-                est_3 = estimate_processing_time(num_transactions, limit_combos=3)
-                est_5 = estimate_processing_time(num_transactions, limit_combos=5)
-                est_10 = estimate_processing_time(num_transactions, limit_combos=10)
                 user_input = input(
-                    f"No combination of transactions found in the last 5 days or around the last reconciled date which if excluded would result in a successful reconcile for account {account}.\n"
-                    f"If you would like, I can search for additional combinations of all transactions which, if excluded, could result in a successful reconcile. There are {num_transactions} unreconciled transactions.\n"
+                    f"No easy combination of transactions have been identified yet which, if excluded, would result in a successful reconcile for account {account}.\n"
+                    f"If you would like, I can search for additional combinations of all transactions. There are {num_transactions} unreconciled transactions.\n"
                     f"Options:\n"
-                    f" - (a)  Estimated time to search all {est_all[1]} combinations: {est_all[0] / 60:.2f} minutes.\n"
-                    f" - (1)  Estimated time to search {est_1[1]} combinations of up to 1 transaction: {est_1[0] / 60:.2f} minutes.\n"
-                    f" - (3)  Estimated time to search {est_3[1]} combinations of up to 3 transactions: {est_3[0] / 60:.2f} minutes.\n"
-                    f" - (5)  Estimated time to search {est_5[1]} combinations of up to 5 transactions: {est_5[0] / 60:.2f} minutes.\n"
-                    f" - (10) Estimated time to search {est_10[1]} combinations of up to 10 transactions: {est_10[0] / 60:.2f} minutes.\n"
-                    f" - (0)  skip searching.\n\n"
+                    f" - (l, limit) Search limited sets of combinations.\n"
+                    f" - (a)  Search ALL {est_all[1]} combinations: {est_all[0] / 60:.2f} minutes.\n"
+                    f" - (s)  skip searching.\n\n"
                     f"Your selection? : ").lower()
                 
-            if user_input == 'a':
-                potential_matches = find_matching_transactions_parallel(all_unreconciled_transactions, discrepancy)
-            elif user_input.isdigit():
-                combo_limit = int(user_input)
-                if combo_limit > 0:
-                    potential_matches = find_matching_transactions_parallel(all_unreconciled_transactions, discrepancy, limit_combos=combo_limit)
+                # Go for broke! Start with searching for all matches!
+                if user_input == 'a':
+                    potential_matches = find_matching_transactions(all_unreconciled_transactions, discrepancy)
+                    if potential_matches:
+                        resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)                                   
+                        if resolved:
+                            conn.commit()
+                            reconciliation_summary[account]["result"] = "Reconciled with exclusions/deletions after extensively searching all transactions."
+                            continue
+
+                elif user_input in ['l', 'limit']:
+                    # We're going to take an iterative approach here
+                    last_limit = 1
+                    new_limit = 1
+                    while not resolved:
+                        if last_limit >= num_transactions:
+                            print(f"We've already gone through all possible transaction combos. Sorry!")
+                            break
+
+                        # Establish next suggested limits
+                        inc_small = last_limit + 1
+                        inc_medium = min(last_limit + 2, num_transactions)
+                        inc_high = min(max(last_limit + ceil((num_transactions - last_limit) / 20), last_limit + 4), num_transactions)
+                        
+                        # Estimate them
+                        est_small  = estimate_processing_time(num_transactions, r_min=last_limit, r_max=inc_small)
+                        est_medium = estimate_processing_time(num_transactions, r_min=last_limit, r_max=inc_medium)
+                        est_high   = estimate_processing_time(num_transactions, r_min=last_limit, r_max=inc_high)
+                        est_all    = estimate_processing_time(num_transactions, r_min=last_limit)
+
+                        # Prompt user
+                        user_input = input(
+                            f"Where would you like to set the limit of number of transactions in a combo?\n"
+                            f" - ({inc_small}) Search {est_small[1]} combinations of up to {inc_small} transactions: {est_small[0] / 60:.2f} minutes.\n"
+                            f" - ({inc_medium}) Search {est_medium[1]} combinations of up to {inc_medium} transactions: {est_medium[0] / 60:.2f} minutes.\n"
+                            f" - ({inc_high}) Search {est_high[1]} combinations of up to {inc_high} transactions: {est_high[0] / 60:.2f} minutes.\n"
+                            f" - (a) Search ALL {est_all[1]} combinations of all transactions: {est_all[0] / 60:.2f} minutes.\n"
+                            f" - (s) If you've had enough, skip further searching.\n\n"
+                            f"Your selection? : ").lower()
+                        
+                        # Read input and act
+                        if user_input in ['a', 'all']:
+                            new_limit = num_transactions
+                        elif user_input.isdigit():
+                            user_input = int(user_input)
+
+                            # Make sure the number is higher than what we've already searched. 
+                            if user_input <= last_limit:
+                                print(f"We've searched for transactions up to {last_limit} already. Pick a higher number, or enter 's' to skip.")
+                                continue
+                            new_limit = min(user_input, num_transactions)
+                            
+                            # Search
+                            potential_matches = find_matching_transactions(all_unreconciled_transactions, discrepancy, r_min=last_limit, r_max=new_limit)
+                            if potential_matches:
+                                resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
+                                if resolved:
+                                    conn.commit()
+                                    reconciliation_summary[account]["result"] = "Reconciled with exclusions/deletions after searching limited combinations of transactions."
+                                    continue
+                                else:
+                                    print(f"Unfortunately, potential matches were rejected. Shall we keep trying?")
+                            else: 
+                                print(f"No matches found in this sample. Shall we keep trying?")
+
+                        else:
+                            break
+
+                        # Finalize this while loop iteration    
+                        last_limit = new_limit
+
+                    else:
+                        reconciliation_summary[account]["result"] = "Reconciled with exclusions/deletions after searching limited combinations of transactions."
+                        continue
+
+                    reconciliation_summary[account]["result"] = "NOT reconciled after iteratively searching combinations of transactions."
+
                 else:
                     print(f"Skipping reconciliation for account {account}.\n\n")
+                    reconciliation_summary[account]["result"] = "NOT reconciled."
                     continue
-            else:
-                print(f"Skipping reconciliation for account {account}.\n\n")
-                continue
         
-        # If we have potential matches...
-        if potential_matches:
-            print(f"Potential transactions matching the discrepancy for account {account}:")
+        # Just a backstop
+        if not resolved:
+            print(f"Tried everything, but could not reconcile account {account}.\n\n")
+            reconciliation_summary[account]["result"] = "NOT reconciled."            
 
-            for i, combo in enumerate(potential_matches):
-                print(f"Combination {i + 1}:")
-                print(f"{'ID':<5} {'Date':<15} {'Merchant':<25} {'Amount':<10}")
-                print("-" * 60)
-                for trans in combo:
-                    transaction_details = get_transaction_details_by_id(cursor, trans[0])
-                    if transaction_details:
-                        print(f"{trans[0]:<5} {transaction_details[0]:<15} {transaction_details[1]:<25} {transaction_details[2]:<10}")
-                    else:
-                        print(f"{trans[0]:<5} {trans[1]:<15} {'NOT FOUND':<25} {trans[2]:<10}")
-                        print(f"  - Date: {trans[1]}, Amount: {trans[2]}")
-                print("\n")
+    # Display the reconciliation summary
+    print("\nReconciliation Summary:")
+    print(f"{'Account':<20} {'Initial Balance':<15} {'Online Balance':<15} {'Discrepancy':<15} {'Result':<40}")
+    print("="*100)
+    for account, details in reconciliation_summary.items():
+        print(f"{account[:19]:<20} {details['initial_balance']:<15} {details['online_balance']:<15} {details['transaction_discrepancy']:<15} {details['result']:<40}")
 
-            # Get user selection
-            selected_combo_index = input("Select the combination number to skip for a successful reconciliation (or -1 to not reconcile this account): ")
-            try:
-                selected_combo_index = int(selected_combo_index)
-            except:
-                selected_combo_index = -1
-            
-            # Begin acting on that selection
-            if selected_combo_index > 0 and selected_combo_index <= len(potential_matches):
-                selected_combo = potential_matches[selected_combo_index - 1]
-                selected_ids = [trans[0] for trans in selected_combo]
-
-                # Verify the sum of amounts matches the expected change in balance
-                cursor.execute('SELECT SUM(amount) FROM transactions WHERE account = ? AND reconciled = 0 AND id NOT IN ({seq})'.format(seq=','.join(['?']*len(selected_ids))),
-                               (account, *selected_ids))
-                verified_sum = cursor.fetchone()[0]
-                if verified_sum is None:
-                    verified_sum = Decimal('0.0')
-                else:
-                    verified_sum = Decimal(verified_sum).quantize(cent)
-
-                expected_change = online_balance_change.quantize(cent)
-
-                if verified_sum == expected_change:
-                    # Ask the user which transactions to exclude and which to delete
-                    exclude_ids = []
-                    delete_ids = []
-                    for trans_id in selected_ids:
-                        action = input(f"Transaction ID {trans_id} should be (e)xcluded from reconciliation or (d)eleted from the database? (e/d): ").lower()
-                        if action == 'd':
-                            delete_ids.append(trans_id)
-                        else:
-                            exclude_ids.append(trans_id)
-                    
-                    # Proceed with reconciliation, excluding selected transactions
-                    if exclude_ids:
-                        cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE account = ? AND reconciled = 0 AND id NOT IN ({seq})'.format(seq=','.join(['?']*len(exclude_ids))), 
-                                       (current_balance_date, account, *exclude_ids))
-                    
-                    # Delete transactions that were marked for deletion
-                    if delete_ids:
-                        cursor.execute('DELETE FROM transactions WHERE id IN ({seq})'.format(seq=','.join(['?']*len(delete_ids))), delete_ids)
-                        print(f"Transaction ids {delete_ids} deleted. Be sure to delete them in Monarch as well, or they will just come back again.")
-                        
-                    cursor.execute('UPDATE account_balances SET last_reconciled_balance = ?, last_reconciled_date = ? WHERE account = ?', 
-                                (current_balance, current_balance_date, account))
-                    conn.commit()
-                    print(f"All transactions except the selected ones have been reconciled for account {account}.")
-                else:
-                    print(f"Sum of amounts to be reconciled ({verified_sum}) does not match the expected change in balance ({expected_change}). No transactions were reconciled.")
-            else:
-                print(f"Transactions not reconciled for account {account}.")
-        else:
-            print(f"No matching transactions found for the discrepancy in account {account}.")
-
+    # END :-)
     conn.close()
 
-def estimate_processing_time(num_transactions, limit_combos=None):
-    global time_per_combination
+def estimate_processing_time(num_transactions, r_min=1, r_max=None):
+    global time_per_combination  # Ensure to use the global variable
 
-    if limit_combos:
-        combinations_count = sum(comb(num_transactions, r) for r in range(1, limit_combos + 1))
-    else:
-        combinations_count = 2**num_transactions - 1
+    if r_max is None:
+        r_max = num_transactions  # Set r_max to the number of transactions if not specified
 
     # Ensure we have time_per_combination calculated already.
     if time_per_combination is None:
-        print(f"Can't accurately estimate processing time yet. Please execure find_matching_transactions_parallel at least once before calling this function.")
-        return -1, combinations_count
+        print("Calculating average time per combination...")
+        time_per_combination = calculate_time_per_combination()
 
-    # Estimate total time based on time per combination
-    est_time = combinations_count * time_per_combination
+    combinations_count = sum(comb(num_transactions, r) for r in range(r_min, r_max + 1))
+    estimated_time = combinations_count * time_per_combination
 
-    print(f"Estimated processing time: {est_time / 60:.2f} minutes for {combinations_count} combinations.")
-    return est_time, combinations_count
+    # print(f"Estimated processing time: {estimated_time / 60:.2f} minutes for {combinations_count} combinations.")
+    return estimated_time, combinations_count
+
+def calculate_time_per_combination():
+    getcontext().prec = 28  # Ensure Decimal precision is set for financial calculations
+
+    # Generate 100 sample transactions with random amounts
+    transactions = [(i, '2024-05-11', random.uniform(-100, 100)) for i in range(100)]
+    discrepancy = Decimal('98.02')  # Set a fixed discrepancy for the test
+    r_min, r_max = 1, 3  # Define the range for combinations
+
+    # Calculate number of combinations to process
+    combinations_count = sum(comb(100, r) for r in range(r_min, r_max + 1))
+
+    start_time = timer()
+    # Process the combinations using the serial approach
+    matching_combinations = find_matching_transactions_serial(transactions, discrepancy, r_min, r_max)
+    end_time = timer()
+
+    # Calculate the average time per combination
+    processing_time = end_time - start_time
+    if combinations_count > 0:
+        average_time_per_combination = processing_time / combinations_count
+    else:
+        average_time_per_combination = 0  # Avoid division by zero if no combinations
+
+    print(f"Calculated average time per combination: {average_time_per_combination:.6f} seconds.")
+    return average_time_per_combination
+
+def find_matching_transactions(transactions, discrepancy, r_min=1, r_max=None):
+    # Skip if there aren't actaully any transactions
+    if len(transactions) < 1:
+        return None
+    
+    # If r_max is not specified, use the maximum possible
+    if r_max is None:
+        r_max = len(transactions)
+
+    # Determine if we should use serial or parallel processing
+    num_combinations = sum(comb(len(transactions), r) for r in range(r_min, r_max + 1))
+    non_parallel_threshold = 10000  # Threshold to decide between serial and parallel processing
+    if num_combinations < non_parallel_threshold:
+        return find_matching_transactions_serial(transactions, discrepancy, r_min, r_max)
+    else:
+        return find_matching_transactions_parallel(transactions, discrepancy, r_min, r_max)
+
+def find_matching_transactions_serial(transactions, discrepancy, r_min, r_max):
+    matching_combinations = []
+    for r in range(r_min, r_max + 1):
+        for combo in combinations(transactions, r):
+            combo_sum = Decimal(sum(Decimal(trans[2]) for trans in combo)).quantize(cent)
+            if combo_sum == -discrepancy:
+                matching_combinations.append(combo)
+    return matching_combinations
+
+def find_matching_transactions_parallel(transactions, discrepancy, r_min, r_max):
+    pool = multiprocessing.Pool()
+    results = [pool.apply_async(process_combinations, args=(transactions, discrepancy, r)) for r in range(r_min, r_max + 1)]
+
+    # Wait for all results to complete and collect them
+    valid_combinations = [result.get() for result in results if result.get()]
+    pool.close()
+    pool.join()
+
+    # Flatten the list of combinations received from each process
+    valid_combinations = [item for sublist in valid_combinations for item in sublist]
+    return valid_combinations
 
 def process_combinations(transactions, discrepancy, r):
     # Create a list to hold the valid combinations
@@ -560,76 +785,98 @@ def process_combinations(transactions, discrepancy, r):
     # Return the list of valid combinations
     return valid_combinations
 
-def find_matching_transactions(transactions, discrepancy, limit_combos=None):
-    global time_per_combination
-    num_transactions = len(transactions)
-    if num_transactions < 1:
-        return None
-
-    # Calculate the number of combinations
-    if limit_combos:
-        number_of_combinations = sum(comb(num_transactions, r) for r in range(1, limit_combos + 1))
-    else:
-        number_of_combinations = 2**num_transactions - 1
-
-    # Configurable threshold for using non-parallel processing
-    non_parallel_threshold = 1000  # Adjust this value based on performance tests and your specific environment
-
-    # Decide whether to use parallel or non-parallel based on the number of combinations
-    if number_of_combinations < non_parallel_threshold:
-        return find_matching_transactions_serial(transactions, discrepancy, limit_combos)
-    else:
-        return find_matching_transactions_parallel(transactions, discrepancy, limit_combos)
-
-def find_matching_transactions_serial(transactions, discrepancy, limit_combos=None):
-    if limit_combos:
-        r_values = range(1, limit_combos + 1)
-    else:
-        r_values = range(1, len(transactions) + 1)
-
-    for r in r_values:
-        for combo in combinations(transactions, r):
-            combo_sum = Decimal(sum(Decimal(trans[2]) for trans in combo)).quantize(cent)
-            if combo_sum == -discrepancy:
-                return [combo]
-    return None
-
-def find_matching_transactions_parallel(transactions, discrepancy, limit_combos=None):
-    global time_per_combination
-    num_transactions = len(transactions)
-    if num_transactions < 1:
-        return None
-
-    pool = multiprocessing.Pool()
-    if limit_combos:
-        r_values = range(1, limit_combos + 1)
-    else:
-        r_values = range(1, num_transactions + 1)
-
-    # Start measuring time if it's the first run and we have a meaningful number of transactions
-    if time_per_combination is None and num_transactions > 3:
-        start_time = time.time()
-
-    # Submit tasks to the pool
-    results = [pool.apply_async(process_combinations, args=(transactions, discrepancy, r)) for r in r_values]
-
-    # Wait for all results to complete and retrieve them
-    results = [res.get() for res in results]
-
-    # Calculate time_per_combination on the first run
-    if time_per_combination is None and num_transactions > 3:
-        end_time = time.time()
-        time_per_combination = (end_time - start_time) / sum(comb(num_transactions, r) for r in r_values)
+def process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance, display_only=False):
+    """
+    Processes potential matching transactions that may resolve a discrepancy.
     
-    pool.close()
-    pool.join()
+    Args:
+        cursor (sqlite3.Cursor): Database cursor for executing SQL commands.
+        account (str): The account for which transactions are being reconciled.
+        potential_matches (list of tuples): List of transaction combinations that match the discrepancy.
+        current_balance_date (str): The date of the current balance check.
+        current_balance (Decimal): Balance as of current_balance_date we are reconciling against.
+        display_only (bool): If True, display the matches but do not ask for confirmation and proceed to reconcile with exclusion.
     
-    # Search for a valid result in the results list
-    for result in results:
-        if result:
-            return result
-    return None
+    Returns:
+        bool: True if the matches were processed and the account reconciled, False otherwise.
+    """
+    print(f"\nPotential transactions matching the discrepancy for account {account}:")
+    
+    for i, combo in enumerate(potential_matches):
+        print(f"Combination {i + 1}:")
+        print(f"{'ID':<5} {'Date':<15} {'Merchant':<25} {'Amount':<10}")
+        print("-" * 60)
+        
+        for trans in combo:
+            transaction_details = get_transaction_details_by_id(cursor, trans[0])
+            if transaction_details:
+                print(f"{trans[0]:<5} {transaction_details[0]:<15} {transaction_details[1]:<25} {transaction_details[2]:<10}")
+            else:
+                print(f"{trans[0]:<5} {trans[1]:<15} {'NOT FOUND':<25} {trans[2]:<10}")
 
+    if display_only:
+        selected_combo = potential_matches[0]
+        selected_ids = [trans[0] for trans in selected_combo]
+
+        exclude_ids = selected_ids
+        cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE account = ? AND reconciled = 0 AND id NOT IN ({seq})'.format(seq=','.join(['?']*len(exclude_ids))), 
+                       (current_balance_date, account, *exclude_ids))
+        cursor.execute('UPDATE account_balances SET last_reconciled_balance = ?, last_reconciled_date = ? WHERE account = ?', 
+                       (Decimal(current_balance).quantize(cent), current_balance_date, account))
+        print(f"Transactions automatically reconciled by excluding these likely pending transactions. Account: {account}.")
+        return True
+    else:
+        # Get user input to select a combination or skip
+        selected_combo_index = input("Select the combination number to reconcile, or s to skip/reject: ")
+        try:
+            selected_combo_index = int(selected_combo_index)
+        except:
+            selected_combo_index = -1    
+
+        if selected_combo_index == -1:
+            print("No transactions reconciled for this account.")
+            return False
+
+        elif 1 <= selected_combo_index <= len(potential_matches):  # Valid numerical values
+            selected_combo = potential_matches[selected_combo_index - 1]
+            selected_ids = [trans[0] for trans in selected_combo]
+
+            exclude_ids = []
+            delete_ids = []
+            reconcile_ids = []
+            for trans_id in selected_ids:
+                action = input(f"Transaction ID {trans_id}: (e)xclude from reconciliation, (d)elete from the database, or mark previously (r)econciled? (e/d/r): ").lower()
+                if action in ['d', 'del', 'delete']:
+                    delete_ids.append(trans_id)
+                elif action in ['r', 'rec', 'reconcile']:
+                    reconcile_ids.append(trans_id)
+                else:
+                    exclude_ids.append(trans_id)
+
+            # Delete transactions that were marked for deletion
+            if delete_ids:
+                cursor.execute('DELETE FROM transactions WHERE id IN ({seq})'.format(seq=','.join(['?']*len(delete_ids))), delete_ids)
+                print(f"Transaction ids {delete_ids} deleted. Be sure to delete them in Monarch as well, or they will just come back again.")
+
+            # Reconcile transactions that were marked for reconciliation
+            if reconcile_ids:
+                cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE id IN ({seq})'.format(seq=','.join(['?']*len(reconcile_ids))), 
+                               (current_balance_date, *reconcile_ids))
+                print(f"Transaction ids {reconcile_ids} reconciled.")
+
+            # Proceed with reconciliation, excluding selected transactions
+            if exclude_ids:
+                cursor.execute('UPDATE transactions SET reconciled = 1, reconcile_date = ? WHERE account = ? AND reconciled = 0 AND id NOT IN ({seq})'.format(seq=','.join(['?']*len(exclude_ids))), 
+                               (current_balance_date, account, *exclude_ids))
+
+            cursor.execute('UPDATE account_balances SET last_reconciled_balance = ?, last_reconciled_date = ? WHERE account = ?', 
+                           (Decimal(current_balance).quantize(cent), current_balance_date, account))
+
+            print(f"Transactions reconciled for account {account}.")
+            return True
+        else:
+            print(f"Invalid selection. No transactions were reconciled for account {account}.")
+            return False
 
 
 
