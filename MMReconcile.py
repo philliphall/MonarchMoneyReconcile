@@ -20,7 +20,7 @@ import sys
 import glob
 from datetime import datetime, timedelta
 from itertools import combinations
-import multiprocessing # Used to more quickly identify combinations of potentially problematic transactions
+import multiprocessing  # Used to more quickly identify combinations of potentially problematic transactions
 from decimal import Decimal, getcontext
 from math import comb, ceil  # Import the comb function for binomial coefficient calculation
 import random
@@ -31,8 +31,8 @@ import shutil
 ### Configuration ###
 db_path = "C:\\Users\\Music\\OneDrive\\Documents\\reconciliation.db" # Where you would like our reconiliation database persistenly stored
 max_backups = 20
-import_folder = "C:\\Users\\Music\\Downloads\\testing\\" # Where to find export tiles from Monarch Money
-earliest_reconcile_date = "2023-01-01"  # Specify the earliest date to reconcile
+import_folder = "C:\\Users\\Music\\Downloads\\" # Where to find export tiles from Monarch Money
+earliest_reconcile_date = "2023-01-01"  # Specify the earliest date to reconcile - format yyyy-mm-dd
 combine_sofi_vaults = True # Okay, this is a weird special case. SoFi bank offers "Vaults" as part of their Savings Account, and some aggregators treat these weird. This will combine the transactions and balances of any accounts that match "SoFi Vault" into the account matching "SoFi Savings" - of which there must be only one or I don't know what will happen.
 
 
@@ -154,7 +154,7 @@ def backup_database(db_path, max_backups=20):
 
 
 
-### Step 2: Importing Transactionns
+### Step 2: Importing Transactions
 def import_transactions(csv_path, db_path='reconciliation.db', earliest_reconcile_date=None):
     # Load transactions from CSV with consistent formatting
     try:
@@ -441,7 +441,7 @@ def set_initial_balances(db_path='reconciliation.db', balance_df=None, earliest_
 
 ### Step 5: Reconcile balances
 def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
-    reconciliation_summary = {} # Initialize
+    reconciliation_summary = {}  # Initialize
     
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -469,12 +469,10 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
         # Calculate online_balance_change and transaction_balance_change
         online_balance_change = current_balance - Decimal(last_reconciled_balance)
         
-        cursor.execute('SELECT SUM(amount) FROM transactions WHERE account = ? AND reconciled = 0', (account,))
-        transaction_balance_change = cursor.fetchone()[0]
-        if transaction_balance_change is None:
-            transaction_balance_change = Decimal('0.0')
-        else:
-            transaction_balance_change = Decimal(transaction_balance_change)
+        cursor.execute('SELECT * FROM transactions WHERE account = ? AND reconciled = 0', (account,))
+        all_unreconciled_transactions = cursor.fetchall()
+        all_unreconciled_transactions_filtered = [(trans[0], trans[1], trans[6]) for trans in all_unreconciled_transactions]
+        transaction_balance_change = sum(Decimal(trans[6]) for trans in all_unreconciled_transactions)
 
         # Calculate the discrepancy only to the cent. This compensates for arbitrary extra decimal places
         discrepancy = (online_balance_change - transaction_balance_change).quantize(cent)
@@ -491,7 +489,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
             cursor.execute('UPDATE account_balances SET last_reconciled_balance = ?, last_reconciled_date = ? WHERE account = ?', 
                            (current_balance, current_balance_date, account))
             conn.commit()
-            print(f"\n\nAll transactions for account {account} add up and have been reconciled.")
+            print(f"\nAll transactions for account {account} add up and have been reconciled.")
             reconciliation_summary[account]["result"] = "Fully reconciled with no discrepancies."
             continue
 
@@ -499,10 +497,10 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
         print(f"\n\nDiscrepancy of {discrepancy} found for account {account}.")
         resolved = False
 
-        ## SIMPLE SEARCHING ##
-        # Get all non-reconciled transactions
-        all_unreconciled_transactions = cursor.execute('''SELECT id, transaction_date, amount FROM transactions WHERE account = ? AND reconciled = 0''', (account,)).fetchall()
+        # Get all non-reconciled transactions as a DataFrame for later use
+        all_unreconciled_df = pd.DataFrame(all_unreconciled_transactions, columns=['id', 'transaction_date', 'merchant', 'category', 'account', 'original_statement', 'amount', 'reconciled', 'import_date', 'reconcile_date'])
 
+        ## SIMPLE SEARCHING ##
         # Check for transactions in the last 5 days that resolve the discrepancy
         last_5_days_transactions = cursor.execute('''
             SELECT id, transaction_date, amount FROM transactions 
@@ -521,8 +519,9 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
                     continue
             else:
                 # Send these transactions for more normal processing
-                potential_matches = find_matching_transactions(recent_and_surrounding_transactions, discrepancy)
+                potential_matches = find_matching_transactions(last_5_days_transactions, discrepancy)
                 if potential_matches:
+                    print("Identified transactions in the last 5 days that may resolve the discrepancy, usually pending transactions. Watch the ids for duplicates that may result from pending transactions.")
                     resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
                     if resolved:
                         conn.commit()
@@ -530,7 +529,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
                         continue
         
         # Fast check for single transaction exact matches
-        exact_matches = [trans for trans in all_unreconciled_transactions if Decimal(trans[2]).quantize(cent) == -discrepancy]
+        exact_matches = [trans for trans in all_unreconciled_transactions if Decimal(trans[6]).quantize(cent) == -discrepancy]
         if exact_matches:
             print("Exact matches found that directly resolve the discrepancy:")
             
@@ -555,6 +554,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
             # Send these transactions for processing
             potential_matches = find_matching_transactions(recent_and_surrounding_transactions, discrepancy)
             if potential_matches:
+                print("Adding in a check for discrpancies around the initial date found potential matches.")
                 resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
                 if resolved:
                     conn.commit()
@@ -570,8 +570,9 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
 
             # Determine if it's reasonable to just look through all missing transactions
             if est_all[0] < 30 and (est_all[0] > 0 or num_transactions < 10):
-                potential_matches = find_matching_transactions(all_unreconciled_transactions, discrepancy)
+                potential_matches = find_matching_transactions(all_unreconciled_transactions_filtered, discrepancy)
                 if potential_matches:
+                    print("I went ahead and searched ALL combinations of unreconciled transactions and found a potential match.")
                     resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
                     if resolved:
                         conn.commit()
@@ -591,7 +592,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
                 
                 # Go for broke! Start with searching for all matches!
                 if user_input == 'a':
-                    potential_matches = find_matching_transactions(all_unreconciled_transactions, discrepancy)
+                    potential_matches = find_matching_transactions(all_unreconciled_transactions_filtered, discrepancy)
                     if potential_matches:
                         resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)                                   
                         if resolved:
@@ -642,7 +643,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
                             new_limit = min(user_input, num_transactions)
                             
                             # Search
-                            potential_matches = find_matching_transactions(all_unreconciled_transactions, discrepancy, r_min=last_limit, r_max=new_limit)
+                            potential_matches = find_matching_transactions(all_unreconciled_transactions_filtered, discrepancy, r_min=last_limit, r_max=new_limit)
                             if potential_matches:
                                 resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
                                 if resolved:
@@ -665,23 +666,26 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
                         continue
 
                     reconciliation_summary[account]["result"] = "NOT reconciled after iteratively searching combinations of transactions."
+                    export_reconciliation_details(account, last_reconciled_balance, last_reconciled_date, all_unreconciled_df, current_balance, discrepancy)
 
                 else:
                     print(f"Skipping reconciliation for account {account}.\n\n")
                     reconciliation_summary[account]["result"] = "NOT reconciled."
+                    export_reconciliation_details(account, last_reconciled_balance, last_reconciled_date, all_unreconciled_df, current_balance, discrepancy)
                     continue
         
         # Just a backstop
         if not resolved:
             print(f"Tried everything, but could not reconcile account {account}.\n\n")
             reconciliation_summary[account]["result"] = "NOT reconciled."            
+            export_reconciliation_details(account, last_reconciled_balance, last_reconciled_date, all_unreconciled_df, current_balance, discrepancy)
 
     # Display the reconciliation summary
     print("\nReconciliation Summary:")
     print(f"{'Account':<20} {'Initial Balance':<15} {'Online Balance':<15} {'Discrepancy':<15} {'Result':<40}")
     print("="*100)
     for account, details in reconciliation_summary.items():
-        print(f"{account[:19]:<20} {details['initial_balance']:<15} {details['online_balance']:<15} {details['transaction_discrepancy']:<15} {details['result']:<40}")
+        print(f"{account[:19]:<20} {str(details['initial_balance'])[:14]:<15} {str(details['online_balance'])[:14]:<15} {str(details['transaction_discrepancy'])[:14]:<15} {details['result']:<40}")
 
     # END :-)
     conn.close()
@@ -707,7 +711,7 @@ def calculate_time_per_combination():
     getcontext().prec = 28  # Ensure Decimal precision is set for financial calculations
 
     # Generate 100 sample transactions with random amounts
-    transactions = [(i, '2024-05-11', random.uniform(-100, 100)) for i in range(100)]
+    transactions = [(i, '2024-05-11', random.uniform(-100, 100)) for i in range(50)]
     discrepancy = Decimal('98.02')  # Set a fixed discrepancy for the test
     r_min, r_max = 1, 3  # Define the range for combinations
 
@@ -878,6 +882,64 @@ def process_potential_matches(cursor, account, potential_matches, current_balanc
             print(f"Invalid selection. No transactions were reconciled for account {account}.")
             return False
 
+def export_reconciliation_details(account, initial_balance, initial_date, transactions, online_balance, discrepancy):
+    """
+    Export or display details of non-reconciled accounts.
+    
+    Args:
+        account (str): The account name.
+        initial_balance (Decimal): The last reconciled balance.
+        initial_date (str): The date of the last reconciled balance.
+        transactions (pd.DataFrame): DataFrame of non-reconciled transactions.
+        online_balance (Decimal): The current online balance.
+        discrepancy (Decimal): The discrepancy amount.
+    """
+    # This is a display function - all monetary values need to have decimals quantized.
+    initial_balance        = Decimal(initial_balance).quantize(cent)
+    online_balance         = Decimal(online_balance).quantize(cent)
+    discrepancy            = Decimal(discrepancy).quantize(cent)
+    transactions['amount'] = [Decimal(amt).quantize(cent) for amt in transactions['amount']]
+    
+    # Display or export options
+    option = input(f"Would you like to display or export details for account {account}? (display/export/skip): ").lower()
+    if option not in ['d', 'display', 'e', 'export']:
+        print("Invalid option selected. Skipping details export.")
+        return
+
+    # Calculate the running balance
+    transactions['running_balance'] = transactions['amount'].cumsum() + initial_balance
+
+    if option in ['d', 'display']:
+        details = f"Account: {account}\n"
+        details += f"Initial Balance (as of {initial_date}): {initial_balance}\n"
+        details += f"Online Balance: {online_balance}\n"
+        details += f"Discrepancy: {discrepancy}\n"
+        details += "\nNon-reconciled Transactions:\n"
+        details += f"{'ID':<5} {'Date':<15} {'Merchant':<25} {'Amount':<10} {'Running Balance':<15}\n"
+        details += "-" * 65 + "\n"
+
+        for idx, row in transactions.iterrows():
+            details += f"{row['id']:<5} {row['transaction_date']:<15} {row['merchant']:<25} {row['amount']:<10} {row['running_balance']:<15}\n"
+        
+        print(details)
+    elif option in ['e', 'export']:
+        export_details = transactions.copy()
+        export_details['account'] = account
+        export_details['initial_balance'] = initial_balance
+        export_details['initial_date'] = initial_date
+        export_details['online_balance'] = online_balance
+        export_details['discrepancy'] = discrepancy
+
+        # Define the order of columns for the CSV
+        columns_order = [
+            'id', 'transaction_date', 'merchant', 'amount', 'running_balance',
+            'account', 'initial_balance', 'initial_date', 'online_balance', 'discrepancy'
+        ]
+
+        # Export to CSV
+        export_path = os.path.join(os.path.dirname(db_path), f"reconciliation_details_{account}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv")
+        export_details.to_csv(export_path, columns=columns_order, index=False)
+        print(f"Details exported to {export_path}")
 
 
 ### HELPER FUNCTIONS
@@ -896,7 +958,6 @@ def find_most_recent_matching_file(directory, pattern):
     else:
         latest_file = max(files, key=os.path.getmtime)
         return latest_file
-
 
 def verify_or_request_file(import_folder, pattern, file_description):
     """
