@@ -267,10 +267,10 @@ def import_transactions(csv_path, db_path='reconciliation.db', earliest_reconcil
     # Display unmatched transactions and prompt user for action
     if num_unmatched_in_db > 0:
         print("\nUnmatched transactions in the database (usually they were pending before):")
-        print(f"{'ID':<5} {'Account':<15} {'Date':<15} {'Merchant':<25} {'Amount':<10} {'Reconciled':<10}")
-        print("-" * 80)
+        print(f"{'ID':<5} {'Account':<20} {'Date':<12} {'Merchant':<25} {'Amount':<10} {'Reconciled':<10}")
+        print("-" * 85)
         for idx, row in unmatched_in_db.sort_values(by=['account', 'transaction_date']).iterrows():
-            print(f"{row['id']:<5} {row['account']:<15} {row['transaction_date']:<15} {row['merchant']:<25} {row['amount']:<10} {row['reconciled']:<10}")
+            print(f"{row['id']:<5} {row['account'][:19]:<20} {row['transaction_date']:<12} {row['merchant'][:24]:<25} {row['amount']:<10} {row['reconciled']:<10}")
 
         response = input("\nWould you like to delete all, none, or select individually? (all/none/select): ").lower()
 
