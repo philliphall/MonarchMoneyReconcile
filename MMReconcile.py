@@ -29,7 +29,7 @@ import shutil
 
 
 ### Configuration ###
-db_path = "C:\\Users\\Music\\OneDrive\\Documents\\reconciliation.db" # Where you would like our reconiliation database persistenly stored
+db_path = "C:\\Users\\Music\\OneDrive\\Documents\\MonarchReconciliation\\reconciliation.db" # Where you would like our reconiliation database persistenly stored
 max_backups = 20
 import_folder = "C:\\Users\\Music\\Downloads\\" # Where to find export tiles from Monarch Money
 earliest_reconcile_date = "2023-01-01"  # Specify the earliest date to reconcile - format yyyy-mm-dd
@@ -54,6 +54,7 @@ sqlite3.register_converter("decimal", convert_decimal)
 
 # We'll use this to calculate estimated time to process potential missing transaction combinations
 time_per_combination = None
+reasonable_time_threshold = 10 # seconds of estimated processing time the script will accept without first prompting the user.
 
 
 
@@ -493,7 +494,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
             reconciliation_summary[account]["result"] = "Fully reconciled with no discrepancies."
             continue
 
-        # There's discrepancy. Start researching it.
+        # There's a discrepancy. Start researching it.
         print(f"\n\nDiscrepancy of {discrepancy} found for account {account}.")
         resolved = False
 
@@ -507,25 +508,43 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
             WHERE account = ? AND transaction_date >= ?
         ''', (account, (datetime.strptime(current_balance_date, '%Y-%m-%d') - timedelta(days=5)).strftime('%Y-%m-%d'))).fetchall()
 
-        # Send these transactions for processing
-        potential_matches = find_matching_transactions(last_5_days_transactions, discrepancy)
-        if potential_matches:
-            if len(potential_matches) == 1:
-                print("Identified transactions in the last 5 days that resolve the discrepancy, usually pending transactions:")
-                resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance, display_only=True)
-                if resolved:
-                    conn.commit()
-                    reconciliation_summary[account]["result"] = "Reconciled with transactions pending."
-                    continue
+        # Estimate processing time for last 5 days transactions
+        num_last_5_days_transactions = len(last_5_days_transactions)
+        est_last_5_days = estimate_processing_time(num_last_5_days_transactions)
+
+        # Decide if we are going to process these
+        proceed = False
+        if est_last_5_days[0] < reasonable_time_threshold and (est_last_5_days[0] > 0 or num_transactions < 10):  
+            proceed = True
+        else: 
+            print(f"Too many transactions ({num_last_5_days_transactions}) in the last 5 days to identify likely pending transactions that should be excluded from the reconcile balance efficiently. Estimated processing time: {est_last_5_days[0]:.2f} seconds.")
+            user_input = input("Do you want to proceed with looking for matches within these transactions? (yes/no): ").lower()
+            if user_input in ['yes', 'y']:
+                proceed = True
+                print(f"I will start looking!")
             else:
-                # Send these transactions for more normal processing
-                potential_matches = find_matching_transactions(last_5_days_transactions, discrepancy)
-                if potential_matches:
-                    print("Identified transactions in the last 5 days that may resolve the discrepancy, usually pending transactions. Watch the ids for duplicates that may result from pending transactions.")
-                    resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
+                print(f"Skipping search for pending transactions in the last 5 days.")
+        
+        # Send these transactions for processing
+        if proceed == True:
+            potential_matches = find_matching_transactions(last_5_days_transactions, discrepancy)
+            if potential_matches:
+                if len(potential_matches) == 1:
+                    print("Identified transactions in the last 5 days that resolve the discrepancy, usually pending transactions:")
+                    resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance, display_only=True)
                     if resolved:
                         conn.commit()
-                        reconciliation_summary[account]["result"] = "Reconciled with exclusions/deletions after simple searching."
+                        reconciliation_summary[account]["result"] = "Reconciled with transactions pending."
+                        continue
+                else:
+                    # Send these transactions for more normal processing
+                    potential_matches = find_matching_transactions(last_5_days_transactions, discrepancy)
+                    if potential_matches:
+                        print("Identified transactions in the last 5 days that may resolve the discrepancy, usually pending transactions. Watch the ids for duplicates that may result from pending transactions.")
+                        resolved = process_potential_matches(cursor, account, potential_matches, current_balance_date, current_balance)
+                        if resolved:
+                            conn.commit()
+                            reconciliation_summary[account]["result"] = "Reconciled with exclusions/deletions after simple searching."
                         continue
         
         # Fast check for single transaction exact matches
@@ -540,7 +559,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
                 reconciliation_summary[account]["result"] = "Reconciled directly with exact matches."
                 continue
 
-        # Check for discrepancies in the last 5 days and around the last reconciled date
+        # Check for discrepancies in the last 5 days AND around the last reconciled date
         if not resolved:
             recent_and_surrounding_transactions = cursor.execute('''
                 SELECT id, transaction_date, amount FROM transactions 
@@ -551,7 +570,25 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
                 (datetime.strptime(last_reconciled_date, '%Y-%m-%d') - timedelta(days=3)).strftime('%Y-%m-%d'),
                 (datetime.strptime(last_reconciled_date, '%Y-%m-%d') + timedelta(days=3)).strftime('%Y-%m-%d'))).fetchall()
 
-            # Send these transactions for processing
+        # Estimate processing time for last 5 days transactions
+        num_recent_and_surrounding_transactions = len(recent_and_surrounding_transactions)
+        est_recent_and_surrounding_transactions = estimate_processing_time(num_recent_and_surrounding_transactions)
+
+        # Decide if we are going to process these
+        proceed = False
+        if est_recent_and_surrounding_transactions[0] < reasonable_time_threshold and (est_recent_and_surrounding_transactions[0] > 0 or num_recent_and_surrounding_transactions < 10):  
+            proceed = True
+        else: 
+            print(f"Too many transactions ({num_recent_and_surrounding_transactions}) in the last 5 days and around the time of the last reconcile date to identify likely pending transactions that should be excluded from the reconcile balance efficiently. Estimated processing time: {est_recent_and_surrounding_transactions[0]:.2f} seconds.")
+            user_input = input("Do you want to proceed with looking for matches within these transactions? (yes/no): ").lower()
+            if user_input in ['yes', 'y']:
+                proceed = True
+                print(f"I will start looking!")
+            else:
+                print(f"Skipping search for pending transactions in the last 5 days.")
+        
+        # Send these transactions for processing
+        if proceed == True:
             potential_matches = find_matching_transactions(recent_and_surrounding_transactions, discrepancy)
             if potential_matches:
                 print("Adding in a check for discrpancies around the initial date found potential matches.")
@@ -569,7 +606,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
             est_all = estimate_processing_time(num_transactions)
 
             # Determine if it's reasonable to just look through all missing transactions
-            if est_all[0] < 30 and (est_all[0] > 0 or num_transactions < 10):
+            if est_all[0] < 10 and (est_all[0] > 0 or num_transactions < 10):
                 potential_matches = find_matching_transactions(all_unreconciled_transactions_filtered, discrepancy)
                 if potential_matches:
                     print("I went ahead and searched ALL combinations of unreconciled transactions and found a potential match.")
@@ -708,15 +745,15 @@ def estimate_processing_time(num_transactions, r_min=1, r_max=None):
     return estimated_time, combinations_count
 
 def calculate_time_per_combination():
-    getcontext().prec = 28  # Ensure Decimal precision is set for financial calculations
+    sample_size = 50
 
-    # Generate 100 sample transactions with random amounts
-    transactions = [(i, '2024-05-11', random.uniform(-100, 100)) for i in range(50)]
+    # Generate sample transactions with random amounts
+    transactions = [(i, '2024-05-11', random.uniform(-100, 100)) for i in range(sample_size)]
     discrepancy = Decimal('98.02')  # Set a fixed discrepancy for the test
     r_min, r_max = 1, 3  # Define the range for combinations
 
     # Calculate number of combinations to process
-    combinations_count = sum(comb(100, r) for r in range(r_min, r_max + 1))
+    combinations_count = sum(comb(sample_size, r) for r in range(r_min, r_max + 1))
 
     start_time = timer()
     # Process the combinations using the serial approach
