@@ -514,7 +514,7 @@ def reconcile_accounts(db_path='reconciliation.db', balance_df=None):
 
         # Decide if we are going to process these
         proceed = False
-        if est_last_5_days[0] < reasonable_time_threshold and (est_last_5_days[0] > 0 or num_transactions < 10):  
+        if est_last_5_days[0] < reasonable_time_threshold and (est_last_5_days[0] > 0 or num_last_5_days_transactions < 10):  
             proceed = True
         else: 
             print(f"Too many transactions ({num_last_5_days_transactions}) in the last 5 days to identify likely pending transactions that should be excluded from the reconcile balance efficiently. Estimated processing time: {est_last_5_days[0]:.2f} seconds.")
